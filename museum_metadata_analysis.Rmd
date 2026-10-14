@@ -1,0 +1,419 @@
+---
+title: "Museum Metadata Detective - Demonstration"
+author: "Shamsaddin Amanov"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+
+library(tidyverse)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 11))
+options(scipen = 999)
+```
+
+# 1. Load the MoMA datasets
+
+This demonstration uses MoMA's open `Artworks.csv` and `Artists.csv` files.
+
+Dataset source: https://github.com/MuseumofModernArt/collection
+
+```{r load-data}
+artwork_files <- c("Artworks.csv", "Artworks(1).csv")
+artist_files <- c("Artists.csv", "Artists(1).csv")
+
+artwork_file <- artwork_files[file.exists(artwork_files)][1]
+artist_file <- artist_files[file.exists(artist_files)][1]
+
+if (is.na(artwork_file) || is.na(artist_file)) {
+  stop("Put Artworks.csv and Artists.csv in the same folder as this RMD file.")
+}
+
+artworks <- read_csv(artwork_file, show_col_types = FALSE)
+artists <- read_csv(artist_file, show_col_types = FALSE)
+
+tibble(
+  Dataset = c("Artworks", "Artists"),
+  Rows = c(nrow(artworks), nrow(artists)),
+  Columns = c(ncol(artworks), ncol(artists))
+) %>%
+  kable(caption = "Dataset size")
+```
+
+# 2. Completeness check
+
+I start with four fields that are important for finding and understanding an artwork: artist, date, medium and dimensions.
+
+```{r completeness}
+core_missing <- tibble(
+  Field = c("Artist", "Date", "Medium", "Dimensions"),
+  Missing = c(
+    sum(is.na(artworks$Artist)),
+    sum(is.na(artworks$Date)),
+    sum(is.na(artworks$Medium)),
+    sum(is.na(artworks$Dimensions))
+  )
+) %>%
+  mutate(
+    Percent = 100 * Missing / nrow(artworks)
+  )
+
+core_missing %>%
+  kable(digits = 2, caption = "Missing values in core artwork fields")
+
+ggplot(core_missing, aes(x = reorder(Field, Missing), y = Missing)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Missing values in four core artwork fields",
+    x = NULL,
+    y = "Number of records"
+  )
+```
+
+# 3. Build four transparent screening signals
+
+The demonstration uses four simple signals:
+
+1. at least one missing core field;
+2. extra leading or trailing whitespace in `Medium`;
+3. a chronological contradiction where a simple artwork year is earlier than the creator's recorded `BeginDate`;
+4. an unusually large height or width above the 99.9th percentile.
+
+These are screening signals, not automatic proof that a museum record is wrong.
+
+```{r build-signals}
+artists_small <- artists %>%
+  transmute(
+    ArtistID = ConstituentID,
+    CreatorBegin = BeginDate,
+    CreatorEnd = EndDate
+  )
+
+analysis <- artworks %>%
+  mutate(
+    Missing_Key_Count =
+      is.na(Artist) +
+      is.na(Date) +
+      is.na(Medium) +
+      is.na(Dimensions),
+
+    Missing_Flag = Missing_Key_Count > 0,
+
+    Medium_Format_Flag =
+      !is.na(Medium) & Medium != str_trim(Medium),
+
+    Single_Artist = replace_na(
+      str_detect(as.character(ConstituentID), "^\\d+$"),
+      FALSE
+    ),
+
+    ArtistID = if_else(
+      Single_Artist,
+      as.integer(ConstituentID),
+      NA_integer_
+    ),
+
+    Date_Clean = str_trim(replace_na(Date, "")),
+
+    Simple_Date = str_detect(
+      Date_Clean,
+      regex("^(?:c\\.\\s*)?\\(?\\d{4}\\)?$", ignore_case = TRUE)
+    ),
+
+    Work_Year = as.integer(str_extract(Date_Clean, "\\d{4}"))
+  ) %>%
+  left_join(artists_small, by = "ArtistID")
+
+height_cutoff <- quantile(
+  analysis$`Height (cm)`[analysis$`Height (cm)` > 0],
+  0.999,
+  na.rm = TRUE
+)
+
+width_cutoff <- quantile(
+  analysis$`Width (cm)`[analysis$`Width (cm)` > 0],
+  0.999,
+  na.rm = TRUE
+)
+
+analysis <- analysis %>%
+  mutate(
+    Logical_Date_Flag = replace_na(
+      Single_Artist &
+        Simple_Date &
+        !is.na(CreatorBegin) &
+        CreatorBegin > 0 &
+        Work_Year < CreatorBegin,
+      FALSE
+    ),
+
+    Extreme_Size_Flag = replace_na(
+      (`Height (cm)` > height_cutoff) |
+        (`Width (cm)` > width_cutoff),
+      FALSE
+    ),
+
+    Signal_Count =
+      as.integer(Missing_Flag) +
+      as.integer(Medium_Format_Flag) +
+      as.integer(Logical_Date_Flag) +
+      as.integer(Extreme_Size_Flag),
+
+    Priority_Tier = case_when(
+      Logical_Date_Flag ~ "Tier 1 - logical contradiction",
+      Signal_Count >= 2 ~ "Tier 2 - multiple signals",
+      Signal_Count == 1 ~ "Tier 3 - single signal",
+      TRUE ~ "No flag"
+    )
+  )
+```
+
+# 4. What did the screening find?
+
+```{r signal-summary}
+signal_summary <- tibble(
+  Signal = c(
+    "Missing core field(s)",
+    "Medium formatting",
+    "Logical date contradiction",
+    "Extreme size"
+  ),
+  Records = c(
+    sum(analysis$Missing_Flag, na.rm = TRUE),
+    sum(analysis$Medium_Format_Flag, na.rm = TRUE),
+    sum(analysis$Logical_Date_Flag, na.rm = TRUE),
+    sum(analysis$Extreme_Size_Flag, na.rm = TRUE)
+  )
+)
+
+signal_summary %>%
+  kable(caption = "Number of records flagged by each signal")
+
+ggplot(signal_summary, aes(x = reorder(Signal, Records), y = Records)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Records flagged by each screening signal",
+    x = NULL,
+    y = "Number of records"
+  )
+```
+
+The `Medium` field also contains formatting variants that disappear after trimming whitespace.
+
+```{r medium-standardisation}
+medium_summary <- tibble(
+  Measure = c(
+    "Unique Medium values before trimming",
+    "Unique Medium values after trimming",
+    "Records with leading/trailing whitespace"
+  ),
+  Value = c(
+    n_distinct(artworks$Medium, na.rm = TRUE),
+    n_distinct(str_trim(artworks$Medium), na.rm = TRUE),
+    sum(analysis$Medium_Format_Flag, na.rm = TRUE)
+  )
+)
+
+medium_summary %>%
+  kable(caption = "Medium standardisation check")
+```
+
+# 5. Review-priority tiers
+
+Logical contradictions receive the highest tier. Records with two or more independent signals are next, followed by records with one signal.
+
+```{r priority-tiers}
+priority_summary <- analysis %>%
+  count(Priority_Tier) %>%
+  mutate(
+    Percent = 100 * n / nrow(analysis)
+  )
+
+priority_summary %>%
+  arrange(desc(n)) %>%
+  kable(digits = 4, caption = "Review-priority tiers")
+
+priority_plot <- priority_summary %>%
+  mutate(
+    Priority_Tier = factor(
+      Priority_Tier,
+      levels = c(
+        "No flag",
+        "Tier 3 - single signal",
+        "Tier 2 - multiple signals",
+        "Tier 1 - logical contradiction"
+      )
+    )
+  )
+
+ggplot(priority_plot, aes(x = Priority_Tier, y = n)) +
+  geom_col() +
+  scale_y_log10() +
+  labs(
+    title = "Review-priority tiers",
+    subtitle = "Log scale is used because the groups differ greatly in size",
+    x = NULL,
+    y = "Number of records (log scale)"
+  ) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+The most useful first-pass queue is Tier 1 plus Tier 2.
+
+```{r review-reduction}
+high_priority_n <- sum(
+  analysis$Priority_Tier %in%
+    c("Tier 1 - logical contradiction", "Tier 2 - multiple signals")
+)
+
+tibble(
+  Measure = c(
+    "Total artwork records",
+    "Tier 1 + Tier 2 records",
+    "Share of collection (%)",
+    "Approximate reduction factor"
+  ),
+  Value = c(
+    nrow(analysis),
+    high_priority_n,
+    100 * high_priority_n / nrow(analysis),
+    nrow(analysis) / high_priority_n
+  )
+) %>%
+  kable(digits = 2, caption = "First-pass review workload")
+```
+
+This shows whether the method can reduce a very large catalogue to a much smaller group for expert review.
+
+# 6. Strong chronological flags
+
+To reduce false positives, this rule is deliberately conservative. It only uses single-creator records and simple date expressions such as `1903`, `(1995)` or `c. 1940`.
+
+`BeginDate` can represent a person's birth year or an organisation's recorded start year, so every result still requires human interpretation.
+
+```{r logical-flags}
+logical_cases <- analysis %>%
+  filter(Logical_Date_Flag) %>%
+  select(
+    ObjectID,
+    Title,
+    Artist,
+    Date,
+    Work_Year,
+    CreatorBegin,
+    CreatorEnd,
+    Department
+  ) %>%
+  arrange(Work_Year)
+
+logical_cases %>%
+  kable(caption = "Tier 1 chronological review candidates")
+```
+
+The known Johan Thorn Prikker example from the proposal should appear in this table.
+
+```{r prikker-check}
+analysis %>%
+  filter(ObjectID == 6521) %>%
+  select(
+    ObjectID,
+    Title,
+    Artist,
+    Date,
+    Work_Year,
+    CreatorBegin,
+    CreatorEnd,
+    Logical_Date_Flag,
+    Priority_Tier
+  ) %>%
+  kable(caption = "Johan Thorn Prikker feasibility check")
+```
+
+# 7. Are flags evenly distributed across departments?
+
+A high flag rate does not automatically mean poor-quality metadata. Different departments describe different kinds of objects, so this check is important for interpretation and fairness.
+
+```{r department-check}
+department_summary <- analysis %>%
+  mutate(
+    Department = replace_na(Department, "Unknown")
+  ) %>%
+  group_by(Department) %>%
+  summarise(
+    Records = n(),
+    Flagged = sum(Signal_Count > 0, na.rm = TRUE),
+    Flag_Rate = 100 * Flagged / Records,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Flag_Rate))
+
+department_summary %>%
+  kable(digits = 2, caption = "Flag rate by department")
+
+ggplot(
+  department_summary,
+  aes(x = reorder(Department, Flag_Rate), y = Flag_Rate)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Share of records with at least one flag by department",
+    x = NULL,
+    y = "Flagged records (%)"
+  )
+```
+
+# 8. Example review queue
+
+The queue below is ordered by tier, then by the number of independent signals. It does not automatically correct any museum record.
+
+```{r review-queue}
+review_queue <- analysis %>%
+  filter(Priority_Tier != "No flag") %>%
+  mutate(
+    Priority_Order = case_when(
+      Priority_Tier == "Tier 1 - logical contradiction" ~ 1,
+      Priority_Tier == "Tier 2 - multiple signals" ~ 2,
+      TRUE ~ 3
+    )
+  ) %>%
+  arrange(
+    Priority_Order,
+    desc(Signal_Count),
+    desc(Missing_Key_Count)
+  ) %>%
+  select(
+    ObjectID,
+    Title,
+    Artist,
+    Department,
+    Date,
+    Signal_Count,
+    Missing_Key_Count,
+    Medium_Format_Flag,
+    Logical_Date_Flag,
+    Extreme_Size_Flag,
+    Priority_Tier
+  )
+
+head(review_queue, 20) %>%
+  kable(caption = "First 20 records in the review queue")
+```
+
+# 9. Demonstration conclusion
+
+This demonstration shows that the project is feasible using ordinary tabular museum data and simple R methods. The four signals create an explainable review-priority system rather than an automatic correction system. The most important result is whether Tier 1 and Tier 2 reduce the full catalogue to a small first-pass review queue while still recovering known examples such as Johan Thorn Prikker.
+
+The department comparison also shows an important limitation: flag rates can reflect different cataloguing practices or object types, so a high flag rate must not automatically be interpreted as poor data quality.
